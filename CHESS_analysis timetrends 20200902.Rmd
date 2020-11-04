@@ -1,0 +1,577 @@
+---
+  title: "CHESS timetrends analysis July 27 download"
+author: "Sebastian Vollmer"
+date: "02 Sept 2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+library(rms)
+library(broom)
+library(tidyverse)
+library(survival)
+library(readxl)
+library(dplyr)
+library(knitr)
+library(finalfit)
+library(coxme)
+library(janitor)
+library(rio)
+library(cobalt)
+library(kableExtra)
+
+opts_chunk$set(results = 'asis',      # Can also be set at the chunk-level
+               comment = NA,
+               prompt  = FALSE,
+               cache   = FALSE)
+
+#Import data
+chess=import("X.csv", setclass="tibble") #X = Chess data
+```
+#Initial data prep
+```{r Initial data prep, include=FALSE}
+#Define function to clean missing data
+empty_as_missing <- function(x){
+  if("factor" %in% class(x)) x <- as.character(x) # since ifelse wont work with factors
+  ifelse(as.character(x)!="", x, "Missing")
+}
+
+## set all missing ("") to Missing for all columns
+chess <- chess %>% mutate_each(funs(empty_as_missing))
+
+#define age categories
+chess$ageyear <- as.numeric(chess$ageyear)
+chess$agecat=cut(chess$ageyear,c(0,18,25,35,45,55,65,75,85,100),include.lowest = TRUE,right=FALSE)
+chess$agecat2 <- fct_collapse(chess$agecat,"18-45"=c("[18,25)","[25,35)","[35,45)"),"45-64"=c("[45,55)","[55,65)"),
+                              "65+"=c("[65,75)","[75,85)","[85,100]"))
+
+#define ethnicity groups, from "Harmonised Concepts and Questions for Social Data Sources - Primary Standards: Ethnic Group" (PDF). Office for National Statistics. Archived (PDF)
+chess <- chess %>% mutate(ethnicity5 = ifelse(ethnicity=="Chinese"|ethnicity=="Bangladeshi"|ethnicity=="Indian"|ethnicity=="Pakistani"|ethnicity=="Other Asian","Asian",
+                                              ifelse(ethnicity=="Black Caribbean"|ethnicity=="Black African"|ethnicity=="Other Black","Black",
+                                                     ifelse(ethnicity=="other","Other", 
+                                                            ifelse(ethnicity=="White British"|ethnicity=="White Irish"|ethnicity=="British"|ethnicity=="Irish"|ethnicity=="Other White","White",
+                                                                   ifelse(ethnicity=="White and Black African"|ethnicity=="White and Black Caribbean"|
+                                                                            ethnicity=="White and Asian"|ethnicity=="Other mixed","Mixed",
+                                                                          ifelse(ethnicity=="Unknown","Missing",
+                                                                                 ethnicity)))))))
+
+#BMI - define obese patients by either recorded obesity category or clinical obesity
+chess <- chess %>% mutate(obese=ifelse(obesitybmi=="25-29.9"|obesitybmi=="30-39.9"|obesitybmi==">39.9","Obese",                                        ifelse(obesitybmi=="<18.5"|obesitybmi=="18.5-24.9"|obesitybmi=="No","Non-obese","Missing")))
+chess <- chess %>% mutate(obese=factor(ifelse((obesitybmi=="Missing"|obesitybmi=="Unknown") & obesityclinical=="Yes","Obese",
+                                              ifelse((obesitybmi=="Missing"|obesitybmi=="Unknown"|obesitybmi=="No") & (obesityclinical=="Borderline"|obesityclinical=="No"),"Non-obese",obese))))  
+
+#Pregnancy
+chess <- chess %>% mutate(pregnant=ifelse(pregnancy=="Yes","Yes","No"))
+
+#Encode dates
+chess$dateadmittedicu <- as.Date(chess$dateadmittedicu, "%Y-%m-%d")
+chess$finaloutcomedate <- as.Date(chess$finaloutcomedate, "%Y-%m-%d")
+chess$hospitaladmissiondate <- as.Date(chess$hospitaladmissiondate, "%Y-%m-%d")
+chess$dateleavingicu <- as.Date(chess$dateleavingicu, "%Y-%m-%d")
+chess$dateupdated <- as.Date(chess$dateupdated, "%Y-%m-%d")
+chess <- chess %>% mutate(dateleavingicu=ifelse(dateleavingicu<=as.Date("2020-01-01"),NA,dateleavingicu))
+chess <- chess %>% mutate(dateadmittedicu=ifelse(chess$dateadmittedicu<=as.Date("2020-01-01"),NA,chess$dateadmittedicu))
+chess <- chess %>% mutate(finaloutcomedate=ifelse(chess$finaloutcomedate<=as.Date("2020-01-01"),NA,chess$finaloutcomedate))
+chess <- chess %>% mutate(hospitaladmissiondate=ifelse(chess$hospitaladmissiondate<=as.Date("2020-01-01"),NA,chess$hospitaladmissiondate))
+chess <- chess %>% mutate(dateupdated=ifelse(chess$dateupdated<=as.Date("2020-01-01"),NA,chess$dateupdated))
+class(chess$dateleavingicu) <- "Date"
+class(chess$dateadmittedicu) <- "Date"
+class(chess$finaloutcomedate) <- "Date"
+class(chess$hospitaladmissiondate) <- "Date"
+class(chess$dateupdated) <- "Date"
+
+#define time from admitted to hospital / ICU to time to finaloutcomedate
+chess$timetooutcome_hosp <- as.numeric(difftime(chess$finaloutcomedate,chess$hospitaladmissiondate, units = c("days")))
+chess$timetooutcome_icu <- as.numeric(difftime(chess$finaloutcomedate,chess$dateadmittedicu, units = c("days")))
+
+#define time from admitted to hospital to when admitted to ICU
+chess$timetoicu <- as.numeric(difftime(chess$dateadmittedicu,chess$hospitaladmissiondate, units = c("days")))
+
+##Define new comorbidity vars with Missing/Unknown recoded to No
+chess <- chess %>% mutate(isdiabetes_clean=factor(ifelse(isdiabetes=="Missing"|isdiabetes=="Unknown","No",isdiabetes)))
+chess <- chess %>% mutate(chronicrespiratory_clean=factor(ifelse(chronicrespiratory=="Missing"|chronicrespiratory=="Unknown","No",chronicrespiratory)))
+chess <- chess %>% mutate(asthmarequiring_clean=factor(ifelse(asthmarequiring=="Missing"|asthmarequiring=="Unknown","No",asthmarequiring)))
+chess <- chess %>% mutate(chronicheart_clean=factor(ifelse(chronicheart=="Missing"|chronicheart=="Unknown","No",chronicheart)))
+chess <- chess %>% mutate(chronicrenal_clean =factor(ifelse(chronicrenal=="Missing"|chronicrenal=="Unknown","No",chronicrenal)))
+chess <- chess %>% mutate(chronicliver_clean=factor(ifelse(chronicliver=="Missing"|chronicliver=="Unknown","No",chronicliver)))
+chess <- chess %>% mutate(chronicneurological_clean=factor(ifelse(chronicneurological=="Missing"|chronicneurological=="Unknown","No",chronicneurological)))
+chess <- chess %>% mutate(immunosuppressiondisease_clean=factor(ifelse(immunosuppressiondisease=="Missing"|immunosuppressiondisease=="Unknown","No",immunosuppressiondisease)))
+chess <- chess %>% mutate(pregnancy_clean =factor(ifelse(pregnancy=="Missing"|pregnancy=="Unknown","No",pregnancy)))
+chess <- chess %>% mutate(hypertension_clean =factor(ifelse(hypertension=="Missing"|hypertension=="Unknown","No",hypertension)))
+
+## Load in STP mapping of NHS Trust -> geographical region
+load("X.RData") #STP mapping of NHS Trust -> geographical region
+trust_STP_mapping <- trust_df_beds %>% group_by(OrgCode) %>% slice(1) %>% ungroup() %>% dplyr::select(STPCode,STPName,STPMapCode,Region,OrgCode)
+trust_STP_mapping$oc_bckup <- trust_STP_mapping$OrgCode
+chess <- merge(chess,trust_STP_mapping,by.x="trustcode",by.y="OrgCode",all.x=TRUE)
+chess$Region <- fct_explicit_na(chess$Region,"Missing")
+
+## Relevel factors for modelling
+chess$isdiabetes <- relevel(as.factor(chess$isdiabetes), ref = "No")
+chess <- chess %>% mutate(agecat=factor(agecat))
+chess$agecat <- relevel(chess$agecat, ref = "[55,65)")
+chess$agecat2 <- relevel(chess$agecat2,ref="18-45")
+chess$ethnicity5 <- relevel(chess$ethnicity5, ref = "White")
+chess$chronicrespiratory <- relevel(factor(chess$chronicrespiratory), ref = "No")
+chess$asthmarequiring<- relevel(factor(chess$asthmarequiring), ref = "No")
+chess$chronicheart <- relevel(factor(chess$chronicheart), ref = "No")
+chess$chronicrenal <- relevel(factor(chess$chronicrenal), ref = "No")
+chess$chronicliver <- relevel(factor(chess$chronicliver), ref = "No")
+chess$immunosuppressiondisease <- relevel(factor(chess$immunosuppressiondisease), ref = "No")
+chess$hypertension <- relevel(factor(chess$hypertension), ref = "No")
+chess$chronicneurological <- relevel(factor(chess$chronicneurological), ref = "No")
+chess$obese <- relevel(factor(chess$obese), ref = "Non-obese")
+chess$Region <- relevel(chess$Region,ref="London")
+```
+# Define cohort for analysis
+```{r Define cohort for analysis, include=FALSE}
+#Starting n
+nrow(chess)
+nrow(data.frame(unique(chess$trustname)))
+
+#Admitted > 1.3.2020
+chess <- chess %>% filter(hospitaladmissiondate>=as.Date("2020-03-01"))
+
+#Admitted < 28.6.2020
+chess <- chess %>% filter(hospitaladmissiondate<as.Date("2020-06-28"))
+
+#remove anyone with missing age from the cohort
+chess <- chess %>% filter(!is.na(ageyear))
+
+#remove anyone >99 from the cohort
+chess <- chess %>% mutate(overA=ifelse(ageyear>99,1,0))
+chess <- chess %>% filter(overA==0)
+
+#remove anyone < 18 from the cohort
+chess <- chess %>% mutate(age0=ifelse(ageyear==0,1,0))
+chess <- chess %>% mutate(under18=ifelse(ageyear<18,1,0))
+chess <- chess %>% filter(under18==0)
+
+#remove anyone with unknown sex from the cohort
+chess <- chess %>% filter(sex!="Unknown")
+
+#Exclude pregnant
+chess <- chess %>% filter(pregnant=="No")
+
+# Define the cohort of ICU admitted patients
+## Require: valid ICU admission date for time to event
+chess <- chess %>% mutate(icudatevalid=ifelse(!is.na(dateadmittedicu),1,0))
+```                           
+# Define survival analysis features & study follow up 
+```{r Define survival analysis features & study follow up} 
+#Define Failure as death, others as censoring events
+chess <- chess %>% mutate(outcome=ifelse(finaloutcome=="Death",1,0))
+
+#survival time
+#define a last study date
+chess$lastdate <- max(chess$finaloutcomedate,na.rm=TRUE)
+#Define date of last follow-up as finaloutcomedate if recorded, if not the dateupdated, if not the lastdate
+chess <- chess %>% mutate(lfudate=as.character(finaloutcomedate))
+chess <- chess %>% mutate(lfudate=ifelse(is.na(lfudate),as.character(dateupdated),lfudate))
+chess <- chess %>% mutate(lfudate=ifelse(is.na(lfudate),as.character(lastdate),lfudate))
+chess$lfudate <- as.Date(chess$lfudate)
+
+#ICU cohort: Define stime as lfudate - date admitted ICU 
+chess <- chess %>% mutate(stime=as.numeric(difftime(chess$lfudate,chess$dateadmittedicu, units = c("days"))+0.5))
+
+#HDU cohort: Define follow up time variable as date of last follow up - 
+#Define stime as lfudate - date admitted hospital
+chess <- chess %>% mutate(stime_fromhosp=as.numeric(difftime(chess$lfudate,chess$hospitaladmissiondate, units = c("days"))+0.5))
+des <- describe(chess$stime_fromhosp) 
+html(des, size=85, tabular=TRUE,
+     greek=TRUE)
+
+#####################################################    
+## Final exclusion set as unsure of follow-up or outcome  
+#####################################################    
+
+#Death but no date
+chess <- chess %>% mutate(deathnodate=ifelse(finaloutcome=="Death" & is.na(finaloutcomedate),1,0))
+#Trans/Disc but not date (may want to exclude transferred)
+chess <- chess %>% mutate(discnodate=ifelse(finaloutcome=="Discharged" & is.na(finaloutcomedate),1,0))
+chess <- chess %>% mutate(trannodate=ifelse(finaloutcome=="Transfered" & is.na(finaloutcomedate),1,0))
+#Enddate but no outcome
+chess <- chess %>% mutate(enddatenooutcome=ifelse(finaloutcome=="Missing" & !is.na(finaloutcomedate),1,0))
+#combined marker for exclusions
+chess <- chess %>% mutate(exclude=ifelse(deathnodate==1|discnodate==1|trannodate==1|enddatenooutcome==1|stimelessthan0==1,1,0))
+## Exclude these patients ##
+chess <- chess %>% filter(exclude==0)
+```
+# ICU Time to event analysis
+```{r ICU Time to event analysis}
+## Backup primary dataset (reload later for HDU model)
+chess_backup <- chess
+
+## Define final cohort of ICU admitted
+chess <- chess %>% filter(icudatevalid==1)
+chess <- chess %>% dplyr::filter(dateadmittedicu>=as.Date("2020-03-01") & (dateadmittedicu<as.Date("2020-06-28")))
+icu_n <- nrow(chess)
+
+###################################################
+## 30-day mortality analysis
+###################################################
+
+#Censor at day 30 setup, if discharged set survival time to 30 days
+chess <- chess %>% mutate(outcome30=ifelse(stime>30,0,outcome))
+chess <- chess %>% mutate(stime30=ifelse(stime>30,30,stime))
+chess <- chess %>% mutate(stime30=ifelse(finaloutcome=="Discharged",30,stime30))
+
+#Define week of admission
+chess$ad_day <- as.numeric(difftime(chess$dateadmittedicu,as.Date("2020-03-01"), units = c("days")))
+chess$ad_week <- floor(chess$ad_day/7)+1
+chess$ad_weekF <- relevel(factor(chess$ad_week),ref="5")
+
+#Calculate proportion of deaths per week of admission
+d1 <- ddply(chess,~ad_week,summarise,
+            n=length(outcome30),
+            died=sum(outcome30),
+            pdied=sum(outcome30)/length(outcome30))
+
+#Subset features of interest for Cox PH modelling
+chess<- chess %>% dplyr::select(stime30,outcome30,isdiabetes_clean,ageyear,sex,ethnicity5,chronicrespiratory_clean,
+                                asthmarequiring_clean,chronicheart_clean ,chronicrenal_clean ,chronicliver_clean,
+                                immunosuppressiondisease_clean, hypertension_clean, chronicneurological_clean, obese, month, ad_week, ad_weekF, timetoicu, Region, STPName, agecat,trustname)
+ddist <- datadist(chess); options(datadist='ddist')
+
+#Cox PH modelling
+
+#Multivariable model
+m1 <- cph(Surv(stime30,outcome30) ~ ad_weekF + isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+            asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+            immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = chess,x=TRUE, y=TRUE)  
+m1
+
+#Random effects sensitivity analysis
+m1 <- coxme(Surv(stime30,outcome30) ~ isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+              asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+              immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region +ad_weekF + (1 | trustname),data = chess) 
+summary(m1)
+p1
+
+#Subgroup analysis (linear trend from week 5)
+
+#Overall
+chess$dummy<- 1
+res<-    chess %>% group_by(dummy) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + rcs(ageyear,3) + sex + isdiabetes_clean + ethnicity5 + chronicrespiratory_clean + asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean + immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(dummy, estimate,lower,upper, p.value)
+res
+res$group <- "Overall"
+res$cat <- "Overall"
+res$dummy <- NULL
+res_overall <- data.frame(res)
+
+#Age
+res<-    chess %>% group_by(agecat2) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(agecat2) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex + isdiabetes_clean + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(agecat2, estimate,lower,upper, p.value)
+res
+res$group <- "Age"
+res$cat <- res$agecat2
+res$agecat2 <- NULL
+res_agecat <- data.frame(res)
+
+#Region   
+res<-    chess %>% group_by(Region) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week +  + rcs(ageyear,3) + sex,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res <- res[1:7,]   
+res<-    chess %>% group_by(Region) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(Region, estimate,lower,upper, p.value)
+res <- res[1:7,]   
+res
+res$group <- "Region"
+res$cat <- res$Region
+res$Region <- NULL
+res_reg <- data.frame(res)
+
+#Sex
+res<-    chess %>% group_by(sex) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week +  + rcs(ageyear,3),data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(sex) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(sex, estimate,lower,upper, p.value)
+res
+res$group <- "Sex"
+res$cat <- res$sex
+res$sex <- NULL
+res_sex <- data.frame(res)
+
+
+#Ethnicity
+res<-    chess %>% group_by(ethnicity5) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex + rcs(ageyear,3),data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(ethnicity5) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + sex + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data =   .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(ethnicity5, estimate,lower,upper, p.value)
+res
+res$group <- "Ethnicity"
+res$cat <- res$ethnicity5
+res$ethnicity5 <- NULL
+res_eth <- data.frame(res)
+
+#Diabetes
+res<-    chess %>% group_by(isdiabetes_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(isdiabetes_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Diabetes"
+res$cat <- res$isdiabetes_clean
+res$isdiabetes_clean <- NULL
+res_dm <- data.frame(res)
+
+#CHF
+res<-    chess %>% group_by(chronicheart_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrenal_clean +
+                  asthmarequiring_clean + chronicrespiratory_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region + timetoicu,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicheart_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic heart disease"
+res$cat <- res$chronicheart_clean
+res$chronicheart_clean <- NULL
+res_chf <- data.frame(res)
+
+#Renal
+res<-    chess %>% group_by(chronicrenal_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicrenal_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic renal disease"
+res$cat <- res$chronicrenal_clean
+res$chronicrenal_clean <- NULL
+res_ren <- data.frame(res)
+
+#Resp
+res<-    chess %>% group_by(chronicrespiratory_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrenal_clean +
+                  asthmarequiring_clean + chronicheart_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + timetoicu + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicrespiratory_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic respiratory disease"
+res$cat <- res$chronicrespiratory_clean
+res$chronicrespiratory_clean <- NULL
+res_resp <- data.frame(res)
+
+#Gen final results data frame for forest plot
+res_icu <- bind_rows(res_overall,res_agecat,res_sex,res_eth, res_dm,res_chf,res_ren, res_resp,res_reg)
+res_icu
+```   
+# HDU Time to event analysis
+```{r HDU Time to event analysis} 
+## Reload whole dataset
+chess <- chess_backup
+## Define final cohort of HDU only admitted patients
+chess <- chess %>% filter(icudatevalid==0)
+hdu_n <- nrow(chess)
+
+##Set follow up time from hospital admission not ICU admission
+chess$stime <- chess$stime_fromhosp
+
+#Censor at day 30 setup, if discharged set survival time to 30 days
+chess <- chess %>% mutate(outcome30=ifelse(stime>30,0,outcome))
+chess <- chess %>% mutate(stime30=ifelse(stime>30,30,stime))
+chess <- chess %>% mutate(stime30=ifelse(finaloutcome=="Discharged",30,stime30))
+
+#Define week of admission
+chess$ad_day <- as.numeric(difftime(chess$hospitaladmissiondate,as.Date("2020-03-01"), units = c("days")))
+chess$ad_week <- floor(chess$ad_day/7)+1
+chess$ad_weekF <- relevel(factor(chess$ad_week),ref="5")  
+
+#Calculate proportion of deaths per week of admission
+d1 <- ddply(chess,~ad_week,summarise,
+            n=length(outcome30),
+            died=sum(outcome30),
+            pdied=sum(outcome30)/length(outcome30))
+d1 <- d1[1:17,]
+
+#Subset features of interest for Cox PH modelling
+chess<- chess %>% dplyr::select(stime30,outcome30,isdiabetes_clean,ageyear,sex,ethnicity5,chronicrespiratory_clean,
+                                asthmarequiring_clean,chronicheart_clean ,chronicrenal_clean ,chronicliver_clean,
+                                immunosuppressiondisease_clean, hypertension_clean, chronicneurological_clean, obese, month, ad_week, ad_weekF, Region, STPName, agecat, trustname)
+ddist <- datadist(chess); options(datadist='ddist')
+
+#Cox PH modelling
+
+#Multivariable model
+m1 <- cph(Surv(stime30,outcome30) ~ ad_weekF + isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+            asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+            immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = chess,x=TRUE, y=TRUE)  
+m1
+
+#Random effects sensitivity analysis
+m1 <- coxme(Surv(stime30,outcome30) ~ isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+              asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+              immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region +ad_weekF + (1 | trustname),data = chess) 
+summary(m1)
+p1   
+
+#Subgroup analysis (linear trend from week 5)
+
+#Overall
+chess$dummy<- 1
+res<-    chess %>% group_by(dummy) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + rcs(ageyear,3) + sex + isdiabetes_clean + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(dummy, estimate,lower,upper, p.value)
+res
+res$group <- "Overall"
+res$cat <- "Overall"
+res$dummy <- NULL
+res_overall <- data.frame(res)
+
+#Age
+res<-    chess %>% group_by(agecat2) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(agecat2) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex + isdiabetes_clean + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(agecat2, estimate,lower,upper, p.value)
+res
+res$group <- "Age"
+res$cat <- res$agecat2
+res$agecat2 <- NULL
+res_agecat <- data.frame(res)
+
+#Region   
+res<-    chess %>% group_by(Region) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week +  + rcs(ageyear,3) + sex,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res <- res[1:7,]
+res
+res<-    chess %>% group_by(Region) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + sex + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(Region, estimate,lower,upper, p.value)
+res <- res[1:7,]   
+res
+res$group <- "Region"
+res$cat <- res$Region
+res$Region <- NULL
+res_reg <- data.frame(res)
+
+#Sex
+res<-    chess %>% group_by(sex) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week +  + rcs(ageyear,3),data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(sex) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(sex, estimate,lower,upper, p.value)
+res
+res$group <- "Sex"
+res$cat <- res$sex
+res$sex <- NULL
+res_sex <- data.frame(res)
+
+
+#Ethnicity
+res<-    chess %>% group_by(ethnicity5) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week + sex + rcs(ageyear,3),data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week")
+res<-    chess %>% group_by(ethnicity5) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+ isdiabetes_clean + rcs(ageyear,3) + sex + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data =   .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(ethnicity5, estimate,lower,upper, p.value)
+res
+res$group <- "Ethnicity"
+res$cat <- res$ethnicity5
+res$ethnicity5 <- NULL
+res_eth <- data.frame(res)
+
+#Diabetes
+res<-chess %>% group_by(isdiabetes_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + chronicrenal_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(isdiabetes_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Diabetes"
+res$cat <- res$isdiabetes_clean
+res$isdiabetes_clean <- NULL
+res_dm <- data.frame(res)
+
+#CHF
+res<-chess %>% group_by(chronicheart_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrenal_clean +
+                  asthmarequiring_clean + chronicrespiratory_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicheart_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic heart disease"
+res$cat <- res$chronicheart_clean
+res$chronicheart_clean <- NULL
+res_chf <- data.frame(res)
+
+#Renal
+res<-chess %>% group_by(chronicrenal_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrespiratory_clean +
+                  asthmarequiring_clean + chronicheart_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese  + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicrenal_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic renal disease"
+res$cat <- res$chronicrenal_clean
+res$chronicrenal_clean <- NULL
+res_ren <- data.frame(res)
+
+#Resp
+res<-chess %>% group_by(chronicrespiratory_clean) %>% 
+  do(tidy(coxph(Surv(stime30,outcome30) ~ ad_week+  rcs(ageyear,3) + ethnicity5 + chronicrenal_clean +
+                  asthmarequiring_clean + chronicheart_clean + isdiabetes_clean + chronicliver_clean +
+                  immunosuppressiondisease_clean + hypertension_clean + chronicneurological_clean  + obese + Region,data = .,subset=ad_week>4)))
+res <- res %>% dplyr::filter(term=="ad_week") %>% mutate(estimate=exp(estimate),lower=exp(conf.low),upper=exp(conf.high)) %>% 
+  dplyr::select(chronicrespiratory_clean, estimate,lower,upper, p.value)
+res
+res$group <- "Chronic respiratory disease"
+res$cat <- res$chronicrespiratory_clean
+res$chronicrespiratory_clean <- NULL
+res_resp <- data.frame(res)
+
+#Gen final results data frame for forest plot
+res_hdu <- bind_rows(res_overall,res_agecat,res_sex,res_eth, res_dm,res_chf, res_ren, res_resp,res_reg)
+```
